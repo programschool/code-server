@@ -14,7 +14,7 @@ import { ILifecycleService } from 'vs/workbench/services/lifecycle/common/lifecy
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { ResourceMap } from 'vs/base/common/map';
 import { IFileService, FileChangesEvent, FileOperation, FileChangeType } from 'vs/platform/files/common/files';
-import { ResourceQueue } from 'vs/base/common/async';
+import { Promises, ResourceQueue } from 'vs/base/common/async';
 import { onUnexpectedError } from 'vs/base/common/errors';
 import { TextFileSaveParticipant } from 'vs/workbench/services/textfile/common/textFileSaveParticipant';
 import { SaveReason } from 'vs/workbench/common/editor';
@@ -95,7 +95,7 @@ export class TextFileEditorModelManager extends Disposable implements ITextFileE
 		this._register(this.workingCopyFileService.onDidRunWorkingCopyFileOperation(e => this.onDidRunWorkingCopyFileOperation(e)));
 
 		// Lifecycle
-		this.lifecycleService.onShutdown(this.dispose, this);
+		this.lifecycleService.onShutdown(() => this.dispose());
 	}
 
 	private onDidFilesChange(e: FileChangesEvent): void {
@@ -227,7 +227,7 @@ export class TextFileEditorModelManager extends Disposable implements ITextFileE
 					if (modelsToRestore) {
 						this.mapCorrelationIdToModelsToRestore.delete(e.correlationId);
 
-						await Promise.all(modelsToRestore.map(async modelToRestore => {
+						await Promises.settled(modelsToRestore.map(async modelToRestore => {
 
 							// restore the model at the target. if we have previous dirty content, we pass it
 							// over to be used, otherwise we force a reload from disk. this is important
@@ -373,7 +373,7 @@ export class TextFileEditorModelManager extends Disposable implements ITextFileE
 		modelListeners.add(model.onDidLoad(reason => this._onDidLoad.fire({ model, reason })));
 		modelListeners.add(model.onDidChangeDirty(() => this._onDidChangeDirty.fire(model)));
 		modelListeners.add(model.onDidSaveError(() => this._onDidSaveError.fire(model)));
-		modelListeners.add(model.onDidSave(reason => this._onDidSave.fire({ model: model, reason })));
+		modelListeners.add(model.onDidSave(reason => this._onDidSave.fire({ model, reason })));
 		modelListeners.add(model.onDidRevert(() => this._onDidRevert.fire(model)));
 		modelListeners.add(model.onDidChangeEncoding(() => this._onDidChangeEncoding.fire(model)));
 

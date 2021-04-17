@@ -14,7 +14,7 @@ import { KeyCode } from 'vs/base/common/keyCodes';
 import { ITreeModel, ITreeNode, ITreeRenderer, ITreeEvent, ITreeMouseEvent, ITreeContextMenuEvent, ITreeFilter, ITreeNavigator, ICollapseStateChangeEvent, ITreeDragAndDrop, TreeDragOverBubble, TreeVisibility, TreeFilterResult, ITreeModelSpliceEvent, TreeMouseEventTarget } from 'vs/base/browser/ui/tree/tree';
 import { ISpliceable } from 'vs/base/common/sequence';
 import { IDragAndDropData, StaticDND, DragAndDropData } from 'vs/base/browser/dnd';
-import { range, equals, distinctES6 } from 'vs/base/common/arrays';
+import { range, equals, distinctES6, firstOrDefault } from 'vs/base/common/arrays';
 import { ElementsDragAndDropData } from 'vs/base/browser/ui/list/listView';
 import { domEvent } from 'vs/base/browser/event';
 import { fuzzyScore, FuzzyScore } from 'vs/base/common/filters';
@@ -400,15 +400,23 @@ class TreeRenderer<T, TFilterData, TRef, TTemplateData> implements IListRenderer
 	}
 
 	private renderTwistie(node: ITreeNode<T, TFilterData>, templateData: ITreeListTemplateData<TTemplateData>) {
+		templateData.twistie.classList.remove(...treeItemExpandedIcon.classNamesArray);
+
+		let twistieRendered = false;
+
 		if (this.renderer.renderTwistie) {
-			this.renderer.renderTwistie(node.element, templateData.twistie);
+			twistieRendered = this.renderer.renderTwistie(node.element, templateData.twistie);
 		}
 
 		if (node.collapsible && (!this.hideTwistiesOfChildlessElements || node.visibleChildrenCount > 0)) {
-			templateData.twistie.classList.add(...treeItemExpandedIcon.classNamesArray, 'collapsible');
+			if (!twistieRendered) {
+				templateData.twistie.classList.add(...treeItemExpandedIcon.classNamesArray);
+			}
+
+			templateData.twistie.classList.add('collapsible');
 			templateData.twistie.classList.toggle('collapsed', node.collapsed);
 		} else {
-			templateData.twistie.classList.remove(...treeItemExpandedIcon.classNamesArray, 'collapsible', 'collapsed');
+			templateData.twistie.classList.remove('collapsible', 'collapsed');
 		}
 
 		if (node.collapsible) {
@@ -675,6 +683,7 @@ class TypeFilterController<T, TFilterData> implements IDisposable {
 		if (typeof options.filterOnType !== 'undefined') {
 			this._filterOnType = !!options.filterOnType;
 			this.filterOnTypeDomNode.checked = this._filterOnType;
+			this.updateFilterOnTypeTitleAndIcon();
 		}
 
 		if (typeof options.automaticKeyboardNavigation !== 'undefined') {
@@ -811,7 +820,7 @@ class TypeFilterController<T, TFilterData> implements IDisposable {
 		const onDragOver = (event: DragEvent) => {
 			event.preventDefault(); // needed so that the drop event fires (https://stackoverflow.com/questions/21339924/drop-event-not-firing-in-chrome)
 
-			const x = event.screenX - left;
+			const x = event.clientX - left;
 			if (event.dataTransfer) {
 				event.dataTransfer.dropEffect = 'none';
 			}
@@ -953,7 +962,8 @@ export interface IAbstractTreeOptionsUpdate extends ITreeRendererOptions {
 	readonly filterOnType?: boolean;
 	readonly smoothScrolling?: boolean;
 	readonly horizontalScrolling?: boolean;
-	readonly expandOnlyOnDoubleClick?: boolean;
+	readonly expandOnDoubleClick?: boolean;
+	readonly expandOnlyOnTwistieClick?: boolean | ((e: any) => boolean); // e is T
 }
 
 export interface IAbstractTreeOptions<T, TFilterData = void> extends IAbstractTreeOptionsUpdate, IListOptions<T> {
@@ -961,7 +971,6 @@ export interface IAbstractTreeOptions<T, TFilterData = void> extends IAbstractTr
 	readonly filter?: ITreeFilter<T, TFilterData>;
 	readonly dnd?: ITreeDragAndDrop<T>;
 	readonly keyboardNavigationEventFilter?: IKeyboardNavigationEventFilter;
-	readonly expandOnlyOnTwistieClick?: boolean | ((e: T) => boolean);
 	readonly additionalScrollHeight?: number;
 }
 
@@ -1109,11 +1118,11 @@ class TreeNodeListMouseController<T, TFilterData, TRef> extends MouseController<
 			expandOnlyOnTwistieClick = !!this.tree.expandOnlyOnTwistieClick;
 		}
 
-		if (expandOnlyOnTwistieClick && !onTwistie) {
+		if (expandOnlyOnTwistieClick && !onTwistie && e.browserEvent.detail !== 2) {
 			return super.onViewPointer(e);
 		}
 
-		if (this.tree.expandOnlyOnDoubleClick && e.browserEvent.detail !== 2 && !onTwistie) {
+		if (!this.tree.expandOnDoubleClick && e.browserEvent.detail === 2) {
 			return super.onViewPointer(e);
 		}
 
@@ -1121,6 +1130,7 @@ class TreeNodeListMouseController<T, TFilterData, TRef> extends MouseController<
 			const model = ((this.tree as any).model as ITreeModel<T, TFilterData, TRef>); // internal
 			const location = model.getNodeLocation(node);
 			const recursive = e.browserEvent.altKey;
+			this.tree.setFocus([location]);
 			model.setCollapsed(location, undefined, recursive);
 
 			if (expandOnlyOnTwistieClick && onTwistie) {
@@ -1134,7 +1144,7 @@ class TreeNodeListMouseController<T, TFilterData, TRef> extends MouseController<
 	protected onDoubleClick(e: IListMouseEvent<ITreeNode<T, TFilterData>>): void {
 		const onTwistie = (e.browserEvent.target as HTMLElement).classList.contains('monaco-tl-twistie');
 
-		if (onTwistie) {
+		if (onTwistie || !this.tree.expandOnDoubleClick) {
 			return;
 		}
 
@@ -1159,6 +1169,7 @@ class TreeNodeList<T, TFilterData, TRef> extends List<ITreeNode<T, TFilterData>>
 		renderers: IListRenderer<any /* TODO@joao */, any>[],
 		private focusTrait: Trait<T>,
 		private selectionTrait: Trait<T>,
+		private anchorTrait: Trait<T>,
 		options: ITreeNodeListOptions<T, TFilterData, TRef>
 	) {
 		super(user, container, virtualDelegate, renderers, options);
@@ -1177,6 +1188,7 @@ class TreeNodeList<T, TFilterData, TRef> extends List<ITreeNode<T, TFilterData>>
 
 		const additionalFocus: number[] = [];
 		const additionalSelection: number[] = [];
+		let anchor: number | undefined;
 
 		elements.forEach((node, index) => {
 			if (this.focusTrait.has(node)) {
@@ -1186,6 +1198,10 @@ class TreeNodeList<T, TFilterData, TRef> extends List<ITreeNode<T, TFilterData>>
 			if (this.selectionTrait.has(node)) {
 				additionalSelection.push(start + index);
 			}
+
+			if (this.anchorTrait.has(node)) {
+				anchor = start + index;
+			}
 		});
 
 		if (additionalFocus.length > 0) {
@@ -1194,6 +1210,10 @@ class TreeNodeList<T, TFilterData, TRef> extends List<ITreeNode<T, TFilterData>>
 
 		if (additionalSelection.length > 0) {
 			super.setSelection(distinctES6([...super.getSelection(), ...additionalSelection]));
+		}
+
+		if (typeof anchor === 'number') {
+			super.setAnchor(anchor);
 		}
 	}
 
@@ -1212,6 +1232,18 @@ class TreeNodeList<T, TFilterData, TRef> extends List<ITreeNode<T, TFilterData>>
 			this.selectionTrait.set(indexes.map(i => this.element(i)), browserEvent);
 		}
 	}
+
+	setAnchor(index: number | undefined, fromAPI = false): void {
+		super.setAnchor(index);
+
+		if (!fromAPI) {
+			if (typeof index === 'undefined') {
+				this.anchorTrait.set([]);
+			} else {
+				this.anchorTrait.set([this.element(index)]);
+			}
+		}
+	}
 }
 
 export abstract class AbstractTree<T, TFilterData, TRef> implements IDisposable {
@@ -1221,6 +1253,7 @@ export abstract class AbstractTree<T, TFilterData, TRef> implements IDisposable 
 	protected model: ITreeModel<T, TFilterData, TRef>;
 	private focus: Trait<T>;
 	private selection: Trait<T>;
+	private anchor: Trait<T>;
 	private eventBufferer = new EventBufferer();
 	private typeFilterController?: TypeFilterController<T, TFilterData>;
 	private focusNavigationFilter: ((node: ITreeNode<T, TFilterData>) => boolean) | undefined;
@@ -1254,8 +1287,8 @@ export abstract class AbstractTree<T, TFilterData, TRef> implements IDisposable 
 	get filterOnType(): boolean { return !!this._options.filterOnType; }
 	get onDidChangeTypeFilterPattern(): Event<string> { return this.typeFilterController ? this.typeFilterController.onDidChangePattern : Event.None; }
 
-	get expandOnlyOnDoubleClick(): boolean { return this._options.expandOnlyOnDoubleClick ?? false; }
-	get expandOnlyOnTwistieClick(): boolean | ((e: T) => boolean) { return typeof this._options.expandOnlyOnTwistieClick === 'undefined' ? false : this._options.expandOnlyOnTwistieClick; }
+	get expandOnDoubleClick(): boolean { return typeof this._options.expandOnDoubleClick === 'undefined' ? true : this._options.expandOnDoubleClick; }
+	get expandOnlyOnTwistieClick(): boolean | ((e: T) => boolean) { return typeof this._options.expandOnlyOnTwistieClick === 'undefined' ? true : this._options.expandOnlyOnTwistieClick; }
 
 	private readonly _onDidUpdateOptions = new Emitter<IAbstractTreeOptions<T, TFilterData>>();
 	readonly onDidUpdateOptions: Event<IAbstractTreeOptions<T, TFilterData>> = this._onDidUpdateOptions.event;
@@ -1289,7 +1322,8 @@ export abstract class AbstractTree<T, TFilterData, TRef> implements IDisposable 
 
 		this.focus = new Trait(_options.identityProvider);
 		this.selection = new Trait(_options.identityProvider);
-		this.view = new TreeNodeList(user, container, treeDelegate, this.renderers, this.focus, this.selection, { ...asListOptions(() => this.model, _options), tree: this });
+		this.anchor = new Trait(_options.identityProvider);
+		this.view = new TreeNodeList(user, container, treeDelegate, this.renderers, this.focus, this.selection, this.anchor, { ...asListOptions(() => this.model, _options), tree: this });
 
 		this.model = this.createModel(user, this.view, _options);
 		onDidChangeCollapseStateRelay.input = this.model.onDidChangeCollapseState;
@@ -1543,6 +1577,25 @@ export abstract class AbstractTree<T, TFilterData, TRef> implements IDisposable 
 		this.model.refilter();
 	}
 
+	setAnchor(element: TRef | undefined): void {
+		if (typeof element === 'undefined') {
+			return this.view.setAnchor(undefined);
+		}
+
+		const node = this.model.getNode(element);
+		this.anchor.set([node]);
+
+		const index = this.model.getListIndex(element);
+
+		if (index > -1) {
+			this.view.setAnchor(index, true);
+		}
+	}
+
+	getAnchor(): T | undefined {
+		return firstOrDefault(this.anchor.get(), undefined);
+	}
+
 	setSelection(elements: TRef[], browserEvent?: UIEvent): void {
 		const nodes = elements.map(e => this.model.getNode(e));
 		this.selection.set(nodes, browserEvent);
@@ -1571,12 +1624,12 @@ export abstract class AbstractTree<T, TFilterData, TRef> implements IDisposable 
 		this.view.focusPrevious(n, loop, browserEvent, filter);
 	}
 
-	focusNextPage(browserEvent?: UIEvent, filter = this.focusNavigationFilter): void {
-		this.view.focusNextPage(browserEvent, filter);
+	focusNextPage(browserEvent?: UIEvent, filter = this.focusNavigationFilter): Promise<void> {
+		return this.view.focusNextPage(browserEvent, filter);
 	}
 
-	focusPreviousPage(browserEvent?: UIEvent, filter = this.focusNavigationFilter): void {
-		this.view.focusPreviousPage(browserEvent, filter);
+	focusPreviousPage(browserEvent?: UIEvent, filter = this.focusNavigationFilter): Promise<void> {
+		return this.view.focusPreviousPage(browserEvent, filter);
 	}
 
 	focusLast(browserEvent?: UIEvent, filter = this.focusNavigationFilter): void {

@@ -40,7 +40,7 @@ export interface IssueReporterStyles extends WindowStyles {
 
 export interface IssueReporterExtensionData {
 	name: string;
-	publisher: string;
+	publisher: string | undefined;
 	version: string;
 	id: string;
 	isTheme: boolean;
@@ -55,6 +55,8 @@ export interface IssueReporterData extends WindowData {
 	enabledExtensions: IssueReporterExtensionData[];
 	issueType?: IssueType;
 	extensionId?: string;
+	experiments?: string;
+	githubAccessToken: string;
 	readonly issueTitle?: string;
 	readonly issueBody?: string;
 }
@@ -71,13 +73,12 @@ export interface IssueReporterFeatures {
 export interface ProcessExplorerStyles extends WindowStyles {
 	hoverBackground?: string;
 	hoverForeground?: string;
-	highlightForeground?: string;
 }
 
 export interface ProcessExplorerData extends WindowData {
 	pid: number;
 	styles: ProcessExplorerStyles;
-	platform: 'win32' | 'darwin' | 'linux';
+	platform: string;
 	applicationName: string;
 }
 

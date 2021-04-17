@@ -5,18 +5,28 @@
 
 import { isWindows, isMacintosh, setImmediate, globals, INodeProcess } from 'vs/base/common/platform';
 
-declare const process: INodeProcess;
-
-let safeProcess: INodeProcess;
+let safeProcess: INodeProcess & { nextTick: (callback: (...args: any[]) => void) => void; };
 
 // Native node.js environment
+declare const process: INodeProcess;
 if (typeof process !== 'undefined') {
-	safeProcess = process;
+	safeProcess = {
+		get platform() { return process.platform; },
+		get env() { return process.env; },
+		cwd() { return process.env['VSCODE_CWD'] || process.cwd(); },
+		nextTick(callback: (...args: any[]) => void): void { return process.nextTick!(callback); }
+	};
 }
 
 // Native sandbox environment
 else if (typeof globals.vscode !== 'undefined') {
-	safeProcess = globals.vscode.process;
+	const sandboxProcess: INodeProcess = globals.vscode.process;
+	safeProcess = {
+		get platform() { return sandboxProcess.platform; },
+		get env() { return sandboxProcess.env; },
+		cwd() { return sandboxProcess.cwd(); },
+		nextTick(callback: (...args: any[]) => void): void { return setImmediate(callback); }
+	};
 }
 
 // Web environment
@@ -24,17 +34,39 @@ else {
 	safeProcess = {
 
 		// Supported
-		get platform(): 'win32' | 'linux' | 'darwin' { return isWindows ? 'win32' : isMacintosh ? 'darwin' : 'linux'; },
+		get platform() { return isWindows ? 'win32' : isMacintosh ? 'darwin' : 'linux'; },
 		nextTick(callback: (...args: any[]) => void): void { return setImmediate(callback); },
 
 		// Unsupported
 		get env() { return Object.create(null); },
-		cwd(): string { return '/'; },
-		getuid(): number { return -1; }
+		cwd() { return '/'; }
 	};
 }
 
+/**
+ * Provides safe access to the `cwd` property in node.js, sandboxed or web
+ * environments.
+ *
+ * Note: in web, this property is hardcoded to be `/`.
+ */
 export const cwd = safeProcess.cwd;
+
+/**
+ * Provides safe access to the `env` property in node.js, sandboxed or web
+ * environments.
+ *
+ * Note: in web, this property is hardcoded to be `{}`.
+ */
 export const env = safeProcess.env;
+
+/**
+ * Provides safe access to the `platform` property in node.js, sandboxed or web
+ * environments.
+ */
 export const platform = safeProcess.platform;
+
+/**
+ * Provides safe access to the `nextTick` method in node.js, sandboxed or web
+ * environments.
+ */
 export const nextTick = safeProcess.nextTick;

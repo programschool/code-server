@@ -16,3 +16,5 @@ node-*
 .home
 coverage
 **/.DS_Store
+# Failed e2e test videos are saved here
+test/test-results
