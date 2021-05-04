@@ -50,8 +50,9 @@ globalSetup(async () => {
 
 const config: Config = {
   testDir: path.join(__dirname, "e2e"), // Search for tests in this directory.
-  timeout: 30000, // Each test is given 30 seconds.
+  timeout: 60000, // Each test is given 60 seconds.
   retries: 3, // Retry failing tests 2 times
+  workers: 1,
 }
 
 if (process.env.CI) {
@@ -64,7 +65,7 @@ setConfig(config)
 
 const options: PlaywrightOptions = {
   headless: true, // Run tests in headless browsers.
-  video: "retain-on-failure",
+  video: "on",
 }
 
 // Run tests in three browsers.
