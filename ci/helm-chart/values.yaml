@@ -6,13 +6,21 @@ replicaCount: 1
 
 image:
   repository: codercom/code-server
-  tag: '3.9.3'
+  tag: '4.108.0'
   pullPolicy: Always
 
+# Specifies one or more secrets to be used when pulling images from a
+# private container repository
+# https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry
 imagePullSecrets: []
+#  - name: registry-creds
+
 nameOverride: ""
 fullnameOverride: ""
 hostnameOverride: ""
+
+# The existing secret to use for code-server authentication in the frontend. the password is stored in the secret under the key `password`
+# existingSecret: ""
 
 serviceAccount:
   # Specifies whether a service account should be created
@@ -23,18 +31,15 @@ serviceAccount:
   # If not set and create is true, a name is generated using the fullname template
   name: ""
 
+# Specifies annotations for deployment
+annotations: {}
+
 podAnnotations: {}
 
 podSecurityContext: {}
   # fsGroup: 2000
 
-securityContext: {}
-  # capabilities:
-  #   drop:
-  #   - ALL
-  # readOnlyRootFilesystem: true
-  # runAsNonRoot: true
-  # runAsUser: 1000
+priorityClassName: ""
 
 service:
   type: ClusterIP
@@ -43,13 +48,12 @@ service:
 ingress:
   enabled: false
   #annotations:
-  #  kubernetes.io/ingress.class: nginx
   #  kubernetes.io/tls-acme: "true"
   #hosts:
   #  - host: code-server.example.loc
   #    paths:
   #      - /
-
+  ingressClassName: ""
   #tls:
   #  - secretName: code-server
   #    hosts:
@@ -57,13 +61,26 @@ ingress:
 
 # Optional additional arguments
 extraArgs: []
-#  - --allow-http
-#  - --no-auth
+  # These are the arguments normally passed to code-server; run
+  # code-server --help for a list of available options.
+  #
+  # Each argument and parameter must have its own entry; if you use
+  # --param value on the command line, then enter it here as:
+  #
+  # - --param
+  # - value
+  #
+  # If you receive an error like "Unknown option --param value", it may be
+  # because both the parameter and value are specified as a single argument,
+  # rather than two separate arguments (e.g. "- --param value" on a line).
 
 # Optional additional environment variables
 extraVars: []
 #  - name: DISABLE_TELEMETRY
-#    value: true
+#    value: "true"
+# if dind is desired:
+#  - name: DOCKER_HOST
+#    value: "tcp://localhost:2376"
 
 ##
 ## Init containers parameters:
@@ -117,33 +134,73 @@ persistence:
   # existingClaim: ""
   # hostPath: /data
 
-serviceAccount:
-  create: true
-  name:
+lifecycle:
+  enabled: false
+  # postStart:
+  #  exec:
+  #    command:
+  #      - /bin/bash
+  #      - -c
+  #      - curl -s -L SOME_SCRIPT | bash
+
+  # for dind, the following may be helpful
+  # postStart:
+  #   exec:
+  #     command:
+  #       - /bin/sh
+  #       - -c
+  #       - |
+  #         sudo apt-get update \
+  #           && sudo apt-get install -y docker.io
 
 ## Enable an Specify container in extraContainers.
 ## This is meant to allow adding code-server dependencies, like docker-dind.
 extraContainers: |
-#- name: docker-dind
-#  image: docker:19.03-dind
-#  imagePullPolicy: IfNotPresent
-#  resources:
-#    requests:
-#      cpu: 250m
-#      memory: 256M
-#  securityContext:
-#    privileged: true
-#    procMount: Default
-#  env:
-#  - name: DOCKER_TLS_CERTDIR
-#    value: ""
-#  - name: DOCKER_DRIVER
-#    value: "overlay2"
+# If docker-dind is used, DOCKER_HOST env is mandatory to set in "extraVars"
+# - name: docker-dind
+#   image: docker:28.3.2-dind
+#   imagePullPolicy: IfNotPresent
+#   resources:
+#     requests:
+#       cpu: 1
+#       ephemeral-storage: "50Gi"
+#       memory: 10Gi
+#   securityContext:
+#     privileged: true
+#     procMount: Default
+#   env:
+#     - name: DOCKER_TLS_CERTDIR
+#       value: "" # disable TLS setup
+#   command:
+#     - dockerd
+#     - --host=unix:///var/run/docker.sock
+#     - --host=tcp://0.0.0.0:2376
+
+
+extraInitContainers: |
+# - name: customization
+#   image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+#   imagePullPolicy: IfNotPresent
+#   env:
+#     - name: SERVICE_URL
+#       value: https://open-vsx.org/vscode/gallery
+#     - name: ITEM_URL
+#       value: https://open-vsx.org/vscode/item
+#   command:
+#     - sh
+#     - -c
+#     - |
+#       code-server --install-extension ms-python.python
+#       code-server --install-extension golang.Go
+#   volumeMounts:
+#     - name: data
+#       mountPath: /home/coder
 
 ## Additional code-server secret mounts
 extraSecretMounts: []
   # - name: secret-files
   #   mountPath: /etc/secrets
+  #   subPath: private.key # (optional)
   #   secretName: code-server-secret-files
   #   readOnly: true
 
@@ -154,6 +211,7 @@ extraVolumeMounts: []
   #   readOnly: true
   #   existingClaim: volume-claim
   #   hostPath: ""
+  #   emptyDir: {}
 
 extraConfigmapMounts: []
   # - name: certs-configmap
@@ -161,3 +219,8 @@ extraConfigmapMounts: []
   #   subPath: certificates.crt # (optional)
   #   configMap: certs-configmap
   #   readOnly: true
+
+extraPorts: []
+  # - name: minecraft
+  #   port: 25565
+  #   protocol: tcp

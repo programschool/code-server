@@ -1,11 +1,11 @@
 import { promises as fs } from "fs"
 import * as net from "net"
 import * as path from "path"
+import * as stream from "stream"
 import * as tls from "tls"
 import { Emitter } from "../common/emitter"
 import { generateUuid } from "../common/util"
-import { tmpdir } from "./constants"
-import { canConnect } from "./util"
+import { canConnect, paths } from "./util"
 
 /**
  * Provides a way to proxy a TLS socket. Can be used when you need to pass a
@@ -13,7 +13,7 @@ import { canConnect } from "./util"
  */
 export class SocketProxyProvider {
   private readonly onProxyConnect = new Emitter<net.Socket>()
-  private proxyPipe = path.join(tmpdir, "tls-proxy")
+  private proxyPipe = path.join(paths.runtime, "tls-proxy")
   private _proxyServer?: Promise<net.Server>
   private readonly proxyTimeout = 5000
 
@@ -28,10 +28,13 @@ export class SocketProxyProvider {
   }
 
   /**
-   * Create a socket proxy for TLS sockets. If it's not a TLS socket the
-   * original socket is returned. This will spawn a proxy server on demand.
+   * Create a socket proxy for TLS sockets. If it is not a TLS socket the
+   * original socket or stream is returned. This will spawn a proxy server on
+   * demand.
    */
-  public async createProxy(socket: net.Socket): Promise<net.Socket> {
+  public async createProxy(socket: tls.TLSSocket | net.Socket): Promise<net.Socket>
+  public async createProxy(socket: stream.Duplex): Promise<stream.Duplex>
+  public async createProxy(socket: tls.TLSSocket | net.Socket | stream.Duplex): Promise<net.Socket | stream.Duplex> {
     if (!(socket instanceof tls.TLSSocket)) {
       return socket
     }
@@ -44,7 +47,7 @@ export class SocketProxyProvider {
       proxy.once("connect", () => proxy.write(id))
 
       const timeout = setTimeout(() => {
-        listener.dispose() // eslint-disable-line @typescript-eslint/no-use-before-define
+        listener.dispose()
         socket.destroy()
         proxy.destroy()
         reject(new Error("TLS socket proxy timed out"))
@@ -76,7 +79,10 @@ export class SocketProxyProvider {
       this._proxyServer = this.findFreeSocketPath(this.proxyPipe)
         .then((pipe) => {
           this.proxyPipe = pipe
-          return Promise.all([fs.mkdir(tmpdir, { recursive: true }), fs.rmdir(this.proxyPipe, { recursive: true })])
+          return Promise.all([
+            fs.mkdir(path.dirname(this.proxyPipe), { recursive: true }),
+            fs.rm(this.proxyPipe, { force: true, recursive: true }),
+          ])
         })
         .then(() => {
           return new Promise((resolve) => {

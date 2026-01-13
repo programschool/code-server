@@ -1,31 +1,41 @@
 import { Request, Response } from "express"
 import * as path from "path"
-import qs from "qs"
-import * as pluginapi from "../../../typings/pluginapi"
 import { HttpCode, HttpError } from "../../common/http"
-import { normalize } from "../../common/util"
-import { authenticated, ensureAuthenticated, redirect } from "../http"
+import { ensureProxyEnabled, authenticated, ensureAuthenticated, ensureOrigin, redirect, self } from "../http"
 import { proxy as _proxy } from "../proxy"
+import type { WebsocketRequest } from "../wsRouter"
 
-const getProxyTarget = (req: Request, passthroughPath?: boolean): string => {
-  if (passthroughPath) {
-    return `http://0.0.0.0:${req.params.port}/${req.originalUrl}`
+const getProxyTarget = (
+  req: Request,
+  opts?: {
+    proxyBasePath?: string
+  },
+): string => {
+  // If there is a base path, strip it out.
+  const base = (req as any).base || ""
+  const port = parseInt(req.params.port, 10)
+  if (isNaN(port)) {
+    throw new HttpError("Invalid port", HttpCode.BadRequest)
   }
-  const query = qs.stringify(req.query)
-  return `http://0.0.0.0:${req.params.port}/${req.params[0] || ""}${query ? `?${query}` : ""}`
+  return `http://0.0.0.0:${port}${opts?.proxyBasePath || ""}/${req.originalUrl.slice(base.length)}`
 }
 
-export function proxy(
+export async function proxy(
   req: Request,
   res: Response,
   opts?: {
     passthroughPath?: boolean
+    proxyBasePath?: string
   },
-): void {
-  if (!authenticated(req)) {
+): Promise<void> {
+  ensureProxyEnabled(req)
+
+  if (req.method === "OPTIONS" && req.args["skip-auth-preflight"]) {
+    // Allow preflight requests with `skip-auth-preflight` flag
+  } else if (!(await authenticated(req))) {
     // If visiting the root (/:port only) redirect to the login page.
-    if (!req.params[0] || req.params[0] === "/") {
-      const to = normalize(`${req.baseUrl}${req.path}`)
+    if (!req.params.path || req.params.path === "/") {
+      const to = self(req)
       return redirect(req, res, "login", {
         to: to !== "/" ? to : undefined,
       })
@@ -33,27 +43,35 @@ export function proxy(
     throw new HttpError("Unauthorized", HttpCode.Unauthorized)
   }
 
+  // The base is used for rewriting (redirects, target).
   if (!opts?.passthroughPath) {
-    // Absolute redirects need to be based on the subpath when rewriting.
-    // See proxy.ts.
     ;(req as any).base = req.path.split(path.sep).slice(0, 3).join(path.sep)
   }
 
   _proxy.web(req, res, {
     ignorePath: true,
-    target: getProxyTarget(req, opts?.passthroughPath),
+    target: getProxyTarget(req, opts),
   })
 }
 
-export function wsProxy(
-  req: pluginapi.WebsocketRequest,
+export async function wsProxy(
+  req: WebsocketRequest,
   opts?: {
     passthroughPath?: boolean
+    proxyBasePath?: string
   },
-): void {
-  ensureAuthenticated(req)
+): Promise<void> {
+  ensureProxyEnabled(req)
+  ensureOrigin(req)
+  await ensureAuthenticated(req)
+
+  // The base is used for rewriting (redirects, target).
+  if (!opts?.passthroughPath) {
+    ;(req as any).base = req.path.split(path.sep).slice(0, 3).join(path.sep)
+  }
+
   _proxy.ws(req, req.ws, req.head, {
     ignorePath: true,
-    target: getProxyTarget(req, opts?.passthroughPath),
+    target: getProxyTarget(req, opts),
   })
 }

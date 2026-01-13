@@ -1,47 +1,76 @@
 import { Request, Router } from "express"
 import { HttpCode, HttpError } from "../../common/http"
-import { normalize } from "../../common/util"
-import { authenticated, ensureAuthenticated, redirect } from "../http"
+import { getHost, ensureProxyEnabled, authenticated, ensureAuthenticated, ensureOrigin, redirect, self } from "../http"
 import { proxy } from "../proxy"
 import { Router as WsRouter } from "../wsRouter"
 
 export const router = Router()
 
+const proxyDomainToRegex = (matchString: string): RegExp => {
+  const escapedMatchString = matchString.replace(/[.*+?^$()|[\]\\]/g, "\\$&")
+
+  // Replace {{port}} with a regex group to capture the port
+  // Replace {{host}} with .+ to allow any host match (so rely on DNS record here)
+  let regexString = escapedMatchString.replace("{{port}}", "(\\d+)")
+  regexString = regexString.replace("{{host}}", ".+")
+
+  regexString = regexString.replace(/[{}]/g, "\\$&") //replace any '{}' that might be left
+
+  return new RegExp("^" + regexString + "$")
+}
+
+let proxyRegexes: RegExp[] = []
+const proxyDomainsToRegex = (proxyDomains: string[]): RegExp[] => {
+  if (proxyDomains.length !== proxyRegexes.length) {
+    proxyRegexes = proxyDomains.map(proxyDomainToRegex)
+  }
+  return proxyRegexes
+}
+
 /**
- * Return the port if the request should be proxied. Anything that ends in a
- * proxy domain and has a *single* subdomain should be proxied. Anything else
- * should return `undefined` and will be handled as normal.
+ * Return the port if the request should be proxied.
  *
- * For example if `coder.com` is specified `8080.coder.com` will be proxied
- * but `8080.test.coder.com` and `test.8080.coder.com` will not.
+ * The proxy-domain should be of format anyprefix-{{port}}-anysuffix.{{host}}, where {{host}} is optional
+ * e.g. code-8080.domain.tld would match for code-{{port}}.domain.tld and code-{{port}}.{{host}}.
+ *
  */
 const maybeProxy = (req: Request): string | undefined => {
-  // Split into parts.
-  const host = req.headers.host || ""
-  const idx = host.indexOf(":")
-  const domain = idx !== -1 ? host.substring(0, idx) : host
-  const parts = domain.split(".")
-
-  // There must be an exact match.
-  const port = parts.shift()
-  const proxyDomain = parts.join(".")
-  if (!port || !req.args["proxy-domain"].includes(proxyDomain)) {
+  const reqDomain = getHost(req)
+  if (reqDomain === undefined) {
     return undefined
   }
 
-  return port
+  const regexs = proxyDomainsToRegex(req.args["proxy-domain"])
+
+  for (const regex of regexs) {
+    const match = reqDomain.match(regex)
+
+    if (match) {
+      return match[1] // match[1] contains the port
+    }
+  }
+
+  return undefined
 }
 
-router.all("*", (req, res, next) => {
+router.all(/.*/, async (req, res, next) => {
   const port = maybeProxy(req)
   if (!port) {
     return next()
   }
 
+  ensureProxyEnabled(req)
+
+  if (req.method === "OPTIONS" && req.args["skip-auth-preflight"]) {
+    // Allow preflight requests with `skip-auth-preflight` flag
+    return next()
+  }
+
   // Must be authenticated to use the proxy.
-  if (!authenticated(req)) {
+  const isAuthenticated = await authenticated(req)
+  if (!isAuthenticated) {
     // Let the assets through since they're used on the login page.
-    if (req.path.startsWith("/static/") && req.method === "GET") {
+    if (req.path.startsWith("/_static/") && req.method === "GET") {
       return next()
     }
 
@@ -55,7 +84,7 @@ router.all("*", (req, res, next) => {
         return next()
       }
       // Redirect all other pages to the login.
-      const to = normalize(`${req.baseUrl}${req.path}`)
+      const to = self(req)
       return redirect(req, res, "login", {
         to: to !== "/" ? to : undefined,
       })
@@ -73,15 +102,15 @@ router.all("*", (req, res, next) => {
 
 export const wsRouter = WsRouter()
 
-wsRouter.ws("*", (req, _, next) => {
+wsRouter.ws(/.*/, async (req, _, next) => {
   const port = maybeProxy(req)
   if (!port) {
     return next()
   }
 
-  // Must be authenticated to use the proxy.
-  ensureAuthenticated(req)
-
+  ensureProxyEnabled(req)
+  ensureOrigin(req)
+  await ensureAuthenticated(req)
   proxy.ws(req, req.ws, req.head, {
     ignorePath: true,
     target: `http://0.0.0.0:${port}${req.originalUrl}`,

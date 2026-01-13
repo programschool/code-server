@@ -1,28 +1,27 @@
 import { logger } from "@coder/logger"
-import bodyParser from "body-parser"
 import cookieParser from "cookie-parser"
 import * as express from "express"
 import { promises as fs } from "fs"
-import http from "http"
 import * as path from "path"
 import * as tls from "tls"
-import * as pluginapi from "../../../typings/pluginapi"
-import { HttpCode, HttpError } from "../../common/http"
+import { Disposable } from "../../common/emitter"
+import { getCookieSessionName, HttpCode, HttpError } from "../../common/http"
 import { plural } from "../../common/util"
+import { App } from "../app"
 import { AuthType, DefaultedArgs } from "../cli"
-import { rootPath } from "../constants"
+import { commit, rootPath } from "../constants"
 import { Heart } from "../heart"
-import { ensureAuthenticated, redirect, replaceTemplates } from "../http"
-import { PluginAPI } from "../plugin"
+import { redirect } from "../http"
+import { CoderSettings, SettingsProvider } from "../settings"
+import { UpdateProvider } from "../update"
 import { getMediaMime, paths } from "../util"
-import { wrapper } from "../wrapper"
-import * as apps from "./apps"
+import type { WebsocketRequest } from "../wsRouter"
 import * as domainProxy from "./domainProxy"
+import { errorHandler, wsErrorHandler } from "./errors"
 import * as health from "./health"
 import * as login from "./login"
+import * as logout from "./logout"
 import * as pathProxy from "./pathProxy"
-// static is a reserved keyword.
-import * as _static from "./static"
 import * as update from "./update"
 import * as vscode from "./vscode"
 
@@ -30,14 +29,20 @@ import * as vscode from "./vscode"
  * Register all routes and middleware.
  */
 export const register = async (
-  app: express.Express,
-  wsApp: express.Express,
-  server: http.Server,
+  app: App,
   args: DefaultedArgs,
-): Promise<void> => {
+): Promise<{ disposeRoutes: Disposable["dispose"]; heart: Heart }> => {
   const heart = new Heart(path.join(paths.data, "heartbeat"), async () => {
     return new Promise((resolve, reject) => {
-      server.getConnections((error, count) => {
+      // getConnections appears to not call the callback when there are no more
+      // connections.  Feels like it must be a bug?  For now add a timer to make
+      // sure we eventually resolve.
+      const timer = setTimeout(() => {
+        logger.debug("Node failed to respond with connections; assuming zero")
+        resolve(false)
+      }, 5000)
+      app.server.getConnections((error, count) => {
+        clearTimeout(timer)
         if (error) {
           return reject(error)
         }
@@ -46,145 +51,139 @@ export const register = async (
       })
     })
   })
-  server.on("close", () => {
-    heart.dispose()
-  })
 
-  app.disable("x-powered-by")
-  wsApp.disable("x-powered-by")
+  app.router.disable("x-powered-by")
+  app.wsRouter.disable("x-powered-by")
 
-  app.use(cookieParser())
-  wsApp.use(cookieParser())
+  app.router.use(cookieParser())
+  app.wsRouter.use(cookieParser())
+
+  const settings = new SettingsProvider<CoderSettings>(path.join(args["user-data-dir"], "coder.json"))
+  const updater = new UpdateProvider("https://api.github.com/repos/coder/code-server/releases/latest", settings)
+
+  const cookieSessionName = getCookieSessionName(args["cookie-suffix"])
 
   const common: express.RequestHandler = (req, _, next) => {
     // /healthz|/healthz/ needs to be excluded otherwise health checks will make
     // it look like code-server is always in use.
     if (!/^\/healthz\/?$/.test(req.url)) {
+      // NOTE@jsjoeio - intentionally not awaiting the .beat() call here because
+      // we don't want to slow down the request.
       heart.beat()
     }
 
     // Add common variables routes can use.
     req.args = args
     req.heart = heart
+    req.settings = settings
+    req.updater = updater
+    req.cookieSessionName = cookieSessionName
 
     next()
   }
 
-  app.use(common)
-  wsApp.use(common)
+  app.router.use(common)
+  app.wsRouter.use(common)
 
-  app.use(async (req, res, next) => {
+  app.router.use(/.*/, async (req, res, next) => {
     // If we're handling TLS ensure all requests are redirected to HTTPS.
     // TODO: This does *NOT* work if you have a base path since to specify the
     // protocol we need to specify the whole path.
     if (args.cert && !(req.connection as tls.TLSSocket).encrypted) {
       return res.redirect(`https://${req.headers.host}${req.originalUrl}`)
     }
-
-    // Return robots.txt.
-    if (req.originalUrl === "/robots.txt") {
-      const resourcePath = path.resolve(rootPath, "src/browser/robots.txt")
-      res.set("Content-Type", getMediaMime(resourcePath))
-      return res.send(await fs.readFile(resourcePath))
-    }
-
     next()
   })
 
-  app.use("/", domainProxy.router)
-  wsApp.use("/", domainProxy.wsRouter.router)
-
-  app.all("/proxy/(:port)(/*)?", (req, res) => {
-    pathProxy.proxy(req, res)
+  app.router.get(["/security.txt", "/.well-known/security.txt"], async (_, res) => {
+    const resourcePath = path.resolve(rootPath, "src/browser/security.txt")
+    res.set("Content-Type", getMediaMime(resourcePath))
+    res.send(await fs.readFile(resourcePath))
   })
-  wsApp.get("/proxy/(:port)(/*)?", (req) => {
-    pathProxy.wsProxy(req as pluginapi.WebsocketRequest)
+
+  app.router.get("/robots.txt", async (_, res) => {
+    const resourcePath = path.resolve(rootPath, "src/browser/robots.txt")
+    res.set("Content-Type", getMediaMime(resourcePath))
+    res.send(await fs.readFile(resourcePath))
+  })
+
+  app.router.use("/", domainProxy.router)
+  app.wsRouter.use("/", domainProxy.wsRouter.router)
+
+  app.router.all("/proxy/:port{/*path}", async (req, res) => {
+    await pathProxy.proxy(req, res)
+  })
+  app.wsRouter.get("/proxy/:port{/*path}", async (req) => {
+    await pathProxy.wsProxy(req as unknown as WebsocketRequest)
   })
   // These two routes pass through the path directly.
   // So the proxied app must be aware it is running
   // under /absproxy/<someport>/
-  app.all("/absproxy/(:port)(/*)?", (req, res) => {
-    pathProxy.proxy(req, res, {
+  app.router.all("/absproxy/:port{/*path}", async (req, res) => {
+    await pathProxy.proxy(req, res, {
       passthroughPath: true,
+      proxyBasePath: args["abs-proxy-base-path"],
     })
   })
-  wsApp.get("/absproxy/(:port)(/*)?", (req) => {
-    pathProxy.wsProxy(req as pluginapi.WebsocketRequest, {
+  app.wsRouter.get("/absproxy/:port{/*path}", async (req) => {
+    await pathProxy.wsProxy(req as unknown as WebsocketRequest, {
       passthroughPath: true,
+      proxyBasePath: args["abs-proxy-base-path"],
     })
   })
 
-  if (!process.env.CS_DISABLE_PLUGINS) {
-    const workingDir = args._ && args._.length > 0 ? path.resolve(args._[args._.length - 1]) : undefined
-    const pluginApi = new PluginAPI(logger, process.env.CS_PLUGIN, process.env.CS_PLUGIN_PATH, workingDir)
-    await pluginApi.loadPlugins()
-    pluginApi.mount(app, wsApp)
-    app.use("/api/applications", ensureAuthenticated, apps.router(pluginApi))
-    wrapper.onDispose(() => pluginApi.dispose())
-  }
+  app.router.use(express.json())
+  app.router.use(express.urlencoded({ extended: true }))
 
-  app.use(bodyParser.json())
-  app.use(bodyParser.urlencoded({ extended: true }))
+  app.router.use(
+    "/_static",
+    express.static(rootPath, {
+      cacheControl: commit !== "development",
+      fallthrough: false,
+      setHeaders: (res, path, stat) => {
+        // The service worker is served from a sub-path on the static route so
+        // this is required to allow it to register a higher scope (by default
+        // the browser only allows it to register from its own path or lower).
+        if (path.endsWith("/serviceWorker.js")) {
+          res.setHeader("Service-Worker-Allowed", "/")
+        }
+      },
+    }),
+  )
 
-  app.use("/", vscode.router)
-  wsApp.use("/", vscode.wsRouter.router)
-  app.use("/vscode", vscode.router)
-  wsApp.use("/vscode", vscode.wsRouter.router)
-
-  app.use("/healthz", health.router)
-  wsApp.use("/healthz", health.wsRouter.router)
+  app.router.use("/healthz", health.router)
+  app.wsRouter.use("/healthz", health.wsRouter.router)
 
   if (args.auth === AuthType.Password) {
-    app.use("/login", login.router)
+    app.router.use("/login", login.router)
+    app.router.use("/logout", logout.router)
   } else {
-    app.all("/login", (req, res) => {
-      redirect(req, res, "/", {})
-    })
+    app.router.all("/login", (req, res) => redirect(req, res, "/", {}))
+    app.router.all("/logout", (req, res) => redirect(req, res, "/", {}))
   }
 
-  app.use("/static", _static.router)
-  app.use("/update", update.router)
+  app.router.use("/update", update.router)
 
-  app.use(() => {
+  // For historic reasons we also load at /vscode because the root was replaced
+  // by a plugin in v1 of Coder.  The plugin system (which was for internal use
+  // only) has been removed, but leave the additional route for now.
+  for (const routePrefix of ["/vscode", "/"]) {
+    app.router.use(routePrefix, vscode.router)
+    app.wsRouter.use(routePrefix, vscode.wsRouter.router)
+  }
+
+  app.router.use(() => {
     throw new HttpError("Not Found", HttpCode.NotFound)
   })
 
-  const errorHandler: express.ErrorRequestHandler = async (err, req, res, next) => {
-    if (err.code === "ENOENT" || err.code === "EISDIR") {
-      err.status = HttpCode.NotFound
-    }
+  app.router.use(errorHandler)
+  app.wsRouter.use(wsErrorHandler)
 
-    const status = err.status ?? err.statusCode ?? 500
-    res.status(status)
-
-    // Assume anything that explicitly accepts text/html is a user browsing a
-    // page (as opposed to an xhr request). Don't use `req.accepts()` since
-    // *every* request that I've seen (in Firefox and Chromium at least)
-    // includes `*/*` making it always truthy. Even for css/javascript.
-    if (req.headers.accept && req.headers.accept.includes("text/html")) {
-      const resourcePath = path.resolve(rootPath, "src/browser/pages/error.html")
-      res.set("Content-Type", getMediaMime(resourcePath))
-      const content = await fs.readFile(resourcePath, "utf8")
-      res.send(
-        replaceTemplates(req, content)
-          .replace(/{{ERROR_TITLE}}/g, status)
-          .replace(/{{ERROR_HEADER}}/g, status)
-          .replace(/{{ERROR_BODY}}/g, err.message),
-      )
-    } else {
-      res.json({
-        error: err.message,
-        ...(err.details || {}),
-      })
-    }
+  return {
+    disposeRoutes: () => {
+      heart.dispose()
+      vscode.dispose()
+    },
+    heart,
   }
-
-  app.use(errorHandler)
-
-  const wsErrorHandler: express.ErrorRequestHandler = async (err, req, res, next) => {
-    logger.error(`${err.message} ${err.stack}`)
-    ;(req as pluginapi.WebsocketRequest).ws.end()
-  }
-
-  wsApp.use(wsErrorHandler)
 }

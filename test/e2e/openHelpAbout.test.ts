@@ -1,46 +1,17 @@
-import { test, expect } from "@playwright/test"
-import { STORAGE } from "../utils/constants"
-import { CodeServer } from "./models/CodeServer"
+import { version } from "../../src/node/constants"
+import { describe, test, expect } from "./baseFixture"
 
-test.describe("Open Help > About", () => {
-  // Create a new context with the saved storage state
-  // so we don't have to logged in
-  const options: any = {}
-  let codeServer: CodeServer
-  // TODO@jsjoeio
-  // Fix this once https://github.com/microsoft/playwright-test/issues/240
-  // is fixed
-  if (STORAGE) {
-    const storageState = JSON.parse(STORAGE) || {}
-    options.contextOptions = {
-      storageState,
-    }
-  }
+describe("Open Help > About", ["--disable-workspace-trust"], {}, () => {
+  test("should see code-server version in about dialog", async ({ codeServerPage }) => {
+    // Open using the menu.
+    await codeServerPage.navigateMenus(["Help", "About"])
 
-  test.beforeEach(async ({ page }) => {
-    codeServer = new CodeServer(page)
-    await codeServer.setup()
+    const isDevMode = process.env.VSCODE_DEV === "1"
+
+    // Look for code-server info div.
+    const element = await codeServerPage.page.waitForSelector(
+      `div[role="dialog"] >> text=code-server: ${isDevMode ? "Unknown" : "v" + version}`,
+    )
+    expect(element).not.toBeNull()
   })
-
-  test(
-    "should see a 'Help' then 'About' button in the Application Menu that opens a dialog",
-    options,
-    async ({ page }) => {
-      // Open using the manu
-      // Click [aria-label="Application Menu"] div[role="none"]
-      await page.click('[aria-label="Application Menu"] div[role="none"]')
-
-      // Click the Help button
-      await page.hover("text=Help")
-      await page.click("text=Help")
-
-      // Click the About button
-      await page.hover("text=About")
-      await page.click("text=About")
-
-      // Click div[role="dialog"] >> text=code-server
-      const element = await page.waitForSelector('div[role="dialog"] >> text=code-server')
-      expect(element).not.toBeNull()
-    },
-  )
 })
